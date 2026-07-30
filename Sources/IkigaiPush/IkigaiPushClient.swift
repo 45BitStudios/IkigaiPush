@@ -167,13 +167,9 @@ public struct IkigaiPushClient: Sendable {
 
     /// Updates a personal Live Activity by application activity id.
     public func updateLiveActivity(id: String, contentState: some Encodable & Sendable) async throws {
-        struct Body<State: Encodable>: Encodable {
-            let activityId: String
-            let contentState: State
-        }
         try await post(
             path: "push/liveactivity/update-by-id",
-            body: Body(activityId: id, contentState: contentState)
+            body: LiveActivityUpdateBody(activityId: id, contentState: contentState)
         )
     }
 
@@ -190,13 +186,9 @@ public struct IkigaiPushClient: Sendable {
 
     /// Ends a personal Live Activity with a final content state.
     public func endLiveActivity(id: String, finalState: some Encodable & Sendable) async throws {
-        struct Body<State: Encodable>: Encodable {
-            let activityId: String
-            let finalContentState: State
-        }
         try await post(
             path: "push/liveactivity/end-by-id",
-            body: Body(activityId: id, finalContentState: finalState)
+            body: LiveActivityEndBody(activityId: id, finalContentState: finalState)
         )
     }
 
@@ -239,25 +231,17 @@ public struct IkigaiPushClient: Sendable {
 
     /// Publishes a Live Activity update to everyone subscribed to the event's channel.
     public func send(toChannel eventId: String, contentState: some Encodable & Sendable) async throws {
-        struct Body<State: Encodable>: Encodable {
-            let contentState: State
-            let event: String
-        }
         try await post(
             path: "push/channels/\(eventId)/update",
-            body: Body(contentState: contentState, event: "update")
+            body: ChannelEventBody(contentState: contentState, event: "update")
         )
     }
 
     /// Ends Live Activities on the event's channel, then deletes the APNs channel.
     public func endChannel(_ eventId: String, finalState: some Encodable & Sendable) async throws {
-        struct Body<State: Encodable>: Encodable {
-            let contentState: State
-            let event: String
-        }
         try await post(
             path: "push/channels/\(eventId)/end",
-            body: Body(contentState: finalState, event: "end")
+            body: ChannelEventBody(contentState: finalState, event: "end")
         )
     }
 
@@ -338,6 +322,24 @@ public struct IkigaiPushClient: Sendable {
         }
         return data
     }
+}
+
+// Request bodies for the generic Live Activity endpoints. Declared at file scope
+// because Swift does not allow a generic type to be nested inside a generic function
+// (which these opaque-parameter methods effectively are).
+private struct LiveActivityUpdateBody<State: Encodable>: Encodable {
+    let activityId: String
+    let contentState: State
+}
+
+private struct LiveActivityEndBody<State: Encodable>: Encodable {
+    let activityId: String
+    let finalContentState: State
+}
+
+private struct ChannelEventBody<State: Encodable>: Encodable {
+    let contentState: State
+    let event: String
 }
 
 /// Empty placeholder for optional encode bodies.
