@@ -114,13 +114,31 @@ public struct IkigaiPushClient: Sendable {
     }
 
     /// Registers an update token for an active Live Activity instance.
-    public func registerLiveActivity(id: String, updateToken: Data, attributesType: String) async throws {
-        let body: [String: String] = [
+    ///
+    /// - Parameters:
+    ///   - id: The iOS `Activity.id`.
+    ///   - updateToken: The activity's `pushToken` from `activity.pushTokenUpdates`.
+    ///   - attributesType: The `ActivityAttributes` type name (e.g. `"BuildActivityAttributes"`).
+    ///   - correlationId: An optional business key (e.g. a build id) shared across every device
+    ///     running the same logical activity. Pass the value the server put in the activity's
+    ///     `attributes` (for a **push-started** activity, read it back off `attributes`) so the
+    ///     server can later drive update/end by correlation via ``updateLiveActivity(correlationId:contentState:)``
+    ///     and ``endLiveActivity(correlationId:finalState:)``.
+    public func registerLiveActivity(
+        id: String,
+        updateToken: Data,
+        attributesType: String,
+        correlationId: String? = nil
+    ) async throws {
+        var body: [String: String] = [
             "deviceId": deviceId,
             "activityId": id,
             "attributesType": attributesType,
             "updateToken": updateToken.ikigaiPushHexString
         ]
+        if let correlationId, !correlationId.isEmpty {
+            body["correlationId"] = correlationId
+        }
         try await put(path: "devices/\(deviceId)/liveactivities/\(id)", body: body)
     }
 
@@ -167,13 +185,9 @@ public struct IkigaiPushClient: Sendable {
 
     /// Updates a personal Live Activity by application activity id.
     public func updateLiveActivity(id: String, contentState: some Encodable & Sendable) async throws {
-        struct Body<State: Encodable>: Encodable {
-            let activityId: String
-            let contentState: State
-        }
         try await post(
             path: "push/liveactivity/update-by-id",
-            body: Body(activityId: id, contentState: contentState)
+            body: UpdateByIdBody(activityId: id, contentState: contentState)
         )
     }
 
@@ -190,13 +204,67 @@ public struct IkigaiPushClient: Sendable {
 
     /// Ends a personal Live Activity with a final content state.
     public func endLiveActivity(id: String, finalState: some Encodable & Sendable) async throws {
-        struct Body<State: Encodable>: Encodable {
-            let activityId: String
-            let finalContentState: State
-        }
         try await post(
             path: "push/liveactivity/end-by-id",
-            body: Body(activityId: id, finalContentState: finalState)
+            body: EndByIdStateBody(activityId: id, finalContentState: finalState)
+        )
+    }
+
+    // MARK: - Correlation-keyed fan-out
+
+    /// Starts a Live Activity on **every** device registered to a user.
+    ///
+    /// The server injects `correlationId` into `attributes`; each device echoes it back when it
+    /// registers its update token (pass the same value to ``registerLiveActivity(id:updateToken:attributesType:correlationId:)``),
+    /// so `updateLiveActivity(correlationId:...)` / `endLiveActivity(correlationId:...)` can fan out
+    /// to all of them. Useful when one logical activity (e.g. a build) should appear on a developer's
+    /// iPhone, iPad, and Mac at once.
+    public func startLiveActivityByUser(
+        userId: String,
+        attributesType: String,
+        attributes: some Encodable & Sendable,
+        contentState: some Encodable & Sendable,
+        correlationId: String? = nil
+    ) async throws {
+        try await post(
+            path: "push/liveactivity/start-by-user",
+            body: StartByUserBody(
+                userId: userId,
+                attributesType: attributesType,
+                attributes: attributes,
+                contentState: contentState,
+                correlationId: correlationId
+            )
+        )
+    }
+
+    /// Updates **every** active Live Activity sharing a `correlationId` (all of a user's devices).
+    public func updateLiveActivity(
+        correlationId: String,
+        contentState: some Encodable & Sendable
+    ) async throws {
+        try await post(
+            path: "push/liveactivity/update-by-correlation",
+            body: UpdateByCorrelationBody(correlationId: correlationId, contentState: contentState)
+        )
+    }
+
+    /// Ends **every** active Live Activity sharing a `correlationId`.
+    public func endLiveActivity(correlationId: String) async throws {
+        try await post(
+            path: "push/liveactivity/end-by-correlation",
+            body: EndByCorrelationBody(correlationId: correlationId)
+        )
+    }
+
+    /// Ends **every** active Live Activity sharing a `correlationId`, with a final content state.
+    public func endLiveActivity(
+        correlationId: String,
+        finalState: some Encodable & Sendable
+    ) async throws {
+        try await post(
+            path: "push/liveactivity/end-by-correlation",
+            body: EndByCorrelationStateBody(correlationId: correlationId, finalContentState: finalState)
         )
     }
 
@@ -239,25 +307,17 @@ public struct IkigaiPushClient: Sendable {
 
     /// Publishes a Live Activity update to everyone subscribed to the event's channel.
     public func send(toChannel eventId: String, contentState: some Encodable & Sendable) async throws {
-        struct Body<State: Encodable>: Encodable {
-            let contentState: State
-            let event: String
-        }
         try await post(
             path: "push/channels/\(eventId)/update",
-            body: Body(contentState: contentState, event: "update")
+            body: ChannelSendBody(contentState: contentState, event: "update")
         )
     }
 
     /// Ends Live Activities on the event's channel, then deletes the APNs channel.
     public func endChannel(_ eventId: String, finalState: some Encodable & Sendable) async throws {
-        struct Body<State: Encodable>: Encodable {
-            let contentState: State
-            let event: String
-        }
         try await post(
             path: "push/channels/\(eventId)/end",
-            body: Body(contentState: finalState, event: "end")
+            body: ChannelSendBody(contentState: finalState, event: "end")
         )
     }
 
@@ -342,6 +402,48 @@ public struct IkigaiPushClient: Sendable {
 
 /// Empty placeholder for optional encode bodies.
 struct EmptyBody: Encodable, Sendable {}
+
+// MARK: - Correlation request bodies
+//
+// Declared at file scope (not nested in the generic client methods) so they compile under
+// strict Swift 6 language mode, which disallows generic types nested in generic functions.
+
+private struct StartByUserBody<A: Encodable, S: Encodable>: Encodable {
+    let userId: String
+    let attributesType: String
+    let attributes: A
+    let contentState: S
+    let correlationId: String?
+}
+
+private struct UpdateByCorrelationBody<State: Encodable>: Encodable {
+    let correlationId: String
+    let contentState: State
+}
+
+private struct EndByCorrelationBody: Encodable {
+    let correlationId: String
+}
+
+private struct EndByCorrelationStateBody<State: Encodable>: Encodable {
+    let correlationId: String
+    let finalContentState: State
+}
+
+private struct UpdateByIdBody<State: Encodable>: Encodable {
+    let activityId: String
+    let contentState: State
+}
+
+private struct EndByIdStateBody<State: Encodable>: Encodable {
+    let activityId: String
+    let finalContentState: State
+}
+
+private struct ChannelSendBody<State: Encodable>: Encodable {
+    let contentState: State
+    let event: String
+}
 
 private extension Data {
     var ikigaiPushHexString: String {
